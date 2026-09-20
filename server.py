@@ -22,6 +22,7 @@ the container down.
 import json
 import os
 import sys
+import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -104,13 +105,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") in ("", "/health"):
-            self._reply(200, {"status": "ok"})
+            if STATE["ready"]:
+                self._reply(200, {"status": "ok"})
+            else:
+                self._reply(503, {"status": STATE["phase"], "error": STATE["error"]})
         else:
             self._reply(404, {"error": "GET /health or POST /ask"})
 
     def do_POST(self):
         if self.path.rstrip("/") not in ("", "/ask"):
             self._reply(404, {"error": "GET /health or POST /ask"})
+            return
+        if not STATE["ready"]:
+            self._reply(503, {"error": "model not ready", "status": STATE["phase"]})
             return
         if not self._authorised():
             self._reply(401, {"error": "bad or missing bearer token"})
@@ -144,29 +151,55 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+STATE = {"phase": "starting", "error": None, "ready": False}
+
+
+def _serve():
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
 def main():
     global AGENT
 
-    if THREADS > 0:
-        torch.set_num_threads(THREADS)
-    log("torch %s, %d threads" % (torch.__version__, torch.get_num_threads()))
-
-    if not os.path.isdir(MODEL_DIR):
-        log("FATAL: no model at %s -- it must be baked into the image" % MODEL_DIR)
-        return 1
-
-    log("loading %s" % MODEL_DIR)
-    AGENT = laya.load(MODEL_DIR, device="cpu")
-    log("loaded on %s, max_len=%s" % (AGENT.device, AGENT.cfg.get("max_len")))
-
-    # A health probe should not pass until the model has actually run once.
-    warm = AGENT.predict("ready", {"q": {"type": "noul", "instructions": "Is this English?"}})
-    log("warmup ok, noul=%.3f" % warm["answers"]["q"]["noul"])
-    log("auth: %s" % ("bearer token required" if API_KEY else "OPEN (no API_KEY set)"))
-
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    # Bind before loading. A model load that hangs rather than crashes would
+    # otherwise leave nothing on the port: the healthcheck fails with curl's
+    # exit 7, the process never exits so `restart` never fires, and the
+    # deployment sits in `healthy: pending` forever with no way to see why.
+    # Serving /health from the first second turns that into a readable phase.
+    threading.Thread(target=_serve, daemon=True).start()
     log("listening on :%d" % PORT)
-    srv.serve_forever()
+
+    try:
+        if THREADS > 0:
+            torch.set_num_threads(THREADS)
+        STATE["phase"] = "torch"
+        log("torch %s, %d threads" % (torch.__version__, torch.get_num_threads()))
+
+        if not os.path.isdir(MODEL_DIR):
+            raise RuntimeError("no model at %s -- it must be baked into the image" % MODEL_DIR)
+
+        STATE["phase"] = "loading"
+        log("loading %s" % MODEL_DIR)
+        AGENT = laya.load(MODEL_DIR, device="cpu")
+        log("loaded on %s, max_len=%s" % (AGENT.device, AGENT.cfg.get("max_len")))
+
+        # A health probe should not pass until the model has actually run once.
+        STATE["phase"] = "warmup"
+        warm = AGENT.predict("ready", {"q": {"type": "noul", "instructions": "Is this English?"}})
+        log("warmup ok, noul=%.3f" % warm["answers"]["q"]["noul"])
+    except BaseException as exc:
+        log("FATAL during %s" % STATE["phase"])
+        STATE["error"] = "%s: %s" % (type(exc).__name__, exc)
+        STATE["phase"] = "failed"
+        traceback.print_exc()
+        # Stay up. The traceback is unreachable from outside a debug enclave,
+        # so /health reporting the error is the only way to see it.
+        threading.Event().wait()
+
+    STATE["phase"] = "ready"
+    STATE["ready"] = True
+    log("auth: %s" % ("bearer token required" if API_KEY else "OPEN (no API_KEY set)"))
+    threading.Event().wait()
 
 
 if __name__ == "__main__":
