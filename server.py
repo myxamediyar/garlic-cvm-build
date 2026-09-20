@@ -90,11 +90,14 @@ def answer(req):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _reply(self, code, obj):
+    def _reply(self, code, obj, close=False):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -113,6 +116,19 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"error": "GET /health or POST /ask"})
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            # Draining megabytes only to discard them is worse than ending the
+            # connection, so say so and close.
+            self._reply(413, {"error": "body over %d bytes" % MAX_BODY}, close=True)
+            return
+
+        # Read the body before any early return. This is a keep-alive server
+        # behind a shim that pools its upstream connection, so a reply that
+        # leaves unread bytes in the socket makes the next request on that
+        # connection start mid-JSON.
+        raw = self.rfile.read(length) if length else b""
+
         if self.path.rstrip("/") not in ("", "/ask"):
             self._reply(404, {"error": "GET /health or POST /ask"})
             return
@@ -122,17 +138,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorised():
             self._reply(401, {"error": "bad or missing bearer token"})
             return
-
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
+        if not raw:
             self._reply(400, {"error": "empty body"})
-            return
-        if length > MAX_BODY:
-            self._reply(413, {"error": "body over %d bytes" % MAX_BODY})
             return
 
         try:
-            req = json.loads(self.rfile.read(length))
+            req = json.loads(raw)
         except json.JSONDecodeError as exc:
             self._reply(400, {"error": "invalid JSON: %s" % exc})
             return
