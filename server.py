@@ -13,6 +13,7 @@ vsock with a length-prefixed frame protocol and a separate proxy on the parent
 translated HTTP into it -- and the parent saw every request in the clear.
 
     POST /ask       {"state", "questions", "detectors"?, "agg"?, "max_len"?, "prefilter"?, "top_k"?, ...}
+                    Content-Length or chunked; attested callers stream chunked.
     GET  /health
 
 `detectors` arrives as [question, option_key] because JSON has no tuples.
@@ -44,6 +45,8 @@ from chunklaya import ChunkLaya  # noqa: E402
 MODEL_DIR = os.environ.get("LAYA_MODEL_DIR", "/opt/models/laya")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_BODY = 64 * 1024 * 1024
+# Cap on one chunk-size line, so a malformed stream cannot grow unbounded.
+_MAX_LINE = 65536
 # Set only to override torch's own choice. It sizes its pool from the physical
 # core count, which is already what this container owns.
 THREADS = int(os.environ.get("LAYA_THREADS", "0"))
@@ -52,6 +55,14 @@ THREADS = int(os.environ.get("LAYA_THREADS", "0"))
 API_KEY = os.environ.get("API_KEY")
 
 AGENT = None
+
+
+class _TooLarge(Exception):
+    """Body over MAX_BODY, however it was framed."""
+
+
+class _BadBody(Exception):
+    """The body's framing is unreadable."""
 
 
 def log(msg):
@@ -117,19 +128,64 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._reply(404, {"error": "GET /health or POST /ask"})
 
-    def do_POST(self):
+    def _read_chunked(self):
+        """Decode a chunked body. BaseHTTPRequestHandler does not do this."""
+        parts, total = [], 0
+        while True:
+            line = self.rfile.readline(_MAX_LINE + 1)
+            if not line:
+                raise _BadBody("connection closed mid-body")
+            size_text = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_text, 16)
+            except ValueError:
+                raise _BadBody("bad chunk size %r" % size_text[:32])
+            if size == 0:
+                while True:  # trailers, then the blank line that ends them
+                    trailer = self.rfile.readline(_MAX_LINE + 1)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            total += size
+            if total > MAX_BODY:
+                raise _TooLarge()
+            parts.append(self.rfile.read(size))
+            self.rfile.read(2)  # the CRLF that closes the chunk
+        return b"".join(parts)
+
+    def _read_body(self):
+        """The request body, however it was framed.
+
+        A client that knows its length sends Content-Length; one that streams
+        sends Transfer-Encoding: chunked. EHBP seals the body and streams it,
+        so reading Content-Length alone saw every attested request as empty.
+        """
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            return self._read_chunked()
+
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY:
-            # Draining megabytes only to discard them is worse than ending the
-            # connection, so say so and close.
-            self._reply(413, {"error": "body over %d bytes" % MAX_BODY}, close=True)
-            return
+            raise _TooLarge()
 
+        return self.rfile.read(length) if length else b""
+
+    def do_POST(self):
         # Read the body before any early return. This is a keep-alive server
         # behind a shim that pools its upstream connection, so a reply that
         # leaves unread bytes in the socket makes the next request on that
         # connection start mid-JSON.
-        raw = self.rfile.read(length) if length else b""
+        try:
+            raw = self._read_body()
+        except _TooLarge:
+            # Draining megabytes only to discard them is worse than ending the
+            # connection, so say so and close.
+            self._reply(413, {"error": "body over %d bytes" % MAX_BODY}, close=True)
+            return
+        except _BadBody as exc:
+            # The framing is broken, so what is left in the socket is not a
+            # request either.
+            self._reply(400, {"error": "malformed body: %s" % exc}, close=True)
+            return
 
         if self.path.rstrip("/") not in ("", "/ask"):
             self._reply(404, {"error": "GET /health or POST /ask"})
