@@ -1,0 +1,57 @@
+# Builds the Tinfoil Container image and pushes it to a private GHCR package.
+# Prints the SHA256 digest at the end -- paste that into tinfoil-config.yml in
+# the public garlic-cvm repo, commit, then run Tinfoil Release there.
+#
+# Plain docker CLI on purpose: no third-party actions in the path that produces
+# the artifact a client attests to.
+name: Build image
+
+run-name: Build ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. v0.0.1)'
+        required: true
+        type: string
+      chunklaya-ref:
+        description: 'chunklaya commit SHA to build from'
+        required: false
+        default: '5a1aa1a322d4c4f932fe0f52a9fb83f737b01a3e'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" \
+             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        id: push
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/garlic-cvm
+          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.chunklaya-ref }}
+        run: |
+          docker build --build-arg "CHUNKLAYA_REF=$REF" -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Paste that line into \`tinfoil-config.yml\` in the public garlic-cvm repo." >> "$GITHUB_STEP_SUMMARY"
