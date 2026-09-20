@@ -18,7 +18,7 @@ on:
       chunklaya-ref:
         description: 'chunklaya commit SHA to build from'
         required: false
-        default: '5a1aa1a322d4c4f932fe0f52a9fb83f737b01a3e'
+        default: '19acae75efe8cd908d83f881869f8e638b836e91'
         type: string
 
 jobs:

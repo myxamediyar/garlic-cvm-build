@@ -12,7 +12,7 @@ it replaces. There, the enclave had no network stack, so the service spoke
 vsock with a length-prefixed frame protocol and a separate proxy on the parent
 translated HTTP into it -- and the parent saw every request in the clear.
 
-    POST /ask       {"state", "questions", "detectors"?, "agg"?, "max_len"?, ...}
+    POST /ask       {"state", "questions", "detectors"?, "agg"?, "max_len"?, "prefilter"?, "top_k"?, ...}
     GET  /health
 
 `detectors` arrives as [question, option_key] because JSON has no tuples.
@@ -71,6 +71,8 @@ def answer(req):
         batch_size=int(req.get("batch_size", 16)),
         mode=req.get("mode", "paragraphs"),
         gate=req.get("gate", "auto"),
+        prefilter=req.get("prefilter"),          # "bm25" to locate first; Laya then scores top_k chunks
+        top_k=int(req.get("top_k", 1)),
         cache=None,  # the container filesystem is ephemeral and read-only
     )
 

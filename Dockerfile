@@ -5,7 +5,7 @@ FROM python:3.12-slim
 
 # chunklaya's own source, pinned by commit. Bump this and rebuild to pick up
 # harness changes; the digest in the public config changes with it.
-ARG CHUNKLAYA_REF=5a1aa1a322d4c4f932fe0f52a9fb83f737b01a3e
+ARG CHUNKLAYA_REF=19acae75efe8cd908d83f881869f8e638b836e91
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
